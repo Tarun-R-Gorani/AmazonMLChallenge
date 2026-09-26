@@ -1,7 +1,7 @@
 """
 train_model.py — Train the entity matcher on the labeled feature table.
 
-Uses HistGradientBoostingClassifier with entity-grouped 80/20 split.
+Uses XGBoost with an entity-grouped 80/20 split.
 Auto-tunes classification threshold on the held-out validation set.
 
 Usage:
@@ -10,15 +10,16 @@ Usage:
         --model-out output/matcher_model.joblib \\
         --val-out output/val_features.tsv
 """
-
 import argparse
+import gc
+import os
 
 import joblib
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import fbeta_score, precision_score, recall_score
+from xgboost import XGBClassifier
 
 from features import FEATURE_COLS
 
@@ -36,9 +37,7 @@ def split_by_entity(df, test_size=0.2, random_state=42):
 
 
 def prepare_xy(df):
-    # Only use the feature columns that actually exist in the data
-    cols = [c for c in FEATURE_COLS if c in df.columns]
-    X = df[cols].astype(float).fillna(0.0)
+    X = df[FEATURE_COLS].astype(np.float32)
     y = df["label"].astype(int)
     return X, y
 
@@ -48,13 +47,18 @@ def train(df):
     pos = int(y.sum())
     neg = len(y) - pos
     # Weight positives by imbalance ratio so the model doesn't ignore matches
-    sample_weight = np.where(y == 1, neg / max(pos, 1), 1.0)
-    model = HistGradientBoostingClassifier(
-        max_iter=500,
+    sample_weight = np.where(y == 1, neg / max(pos, 1), 1.0).astype(np.float32)
+    model = XGBClassifier(
+        n_estimators=500,
         learning_rate=0.05,
         max_depth=7,
-        min_samples_leaf=20,
-        l2_regularization=0.1,
+        min_child_weight=20,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        reg_lambda=1.0,
+        tree_method="hist",
+        eval_metric="logloss",
+        n_jobs=-1,
         random_state=42,
     )
     model.fit(X, y, sample_weight=sample_weight)
@@ -90,16 +94,33 @@ def tune_threshold(model, val_df, beta=0.5):
 
 
 def main():
+    # SageMaker supplies these paths for input channels and training outputs.
+    # The fallbacks preserve the existing local project layout.
+    output_dir = os.environ.get("SM_OUTPUT_DIR", "output")
+    model_dir = os.environ.get("SM_MODEL_DIR", output_dir)
+    train_dir = os.environ.get("SM_CHANNEL_TRAIN", output_dir)
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--features",      default="output/train_features.tsv")
-    parser.add_argument("--model-out",     default="output/matcher_model.joblib")
-    parser.add_argument("--val-out",       default="output/val_features.tsv")
+    parser.add_argument("--features", default=os.path.join(train_dir, "train_features.tsv"))
+    parser.add_argument("--model-out", default=os.path.join(model_dir, "matcher_model.joblib"))
+    parser.add_argument("--val-out", default=os.path.join(output_dir, "val_features.tsv"))
+    parser.add_argument(
+        "--threshold-out",
+        default=os.path.join(output_dir, "best_threshold.txt"),
+    )
     parser.add_argument("--test-size",     type=float, default=0.2)
     parser.add_argument("--random-state",  type=int,   default=42)
     args = parser.parse_args()
 
     print(f"[train_model.py] loading {args.features} ...")
-    df = pd.read_csv(args.features, sep="\t")
+    df = pd.read_csv(args.features, sep="\t", encoding="utf-8")
+    required_cols = {"source1_entity_id", "candidate_entity_id", "label", *FEATURE_COLS}
+    missing_cols = sorted(required_cols - set(df.columns))
+    if missing_cols:
+        raise ValueError(
+            f"{args.features} is missing required columns: {missing_cols}. "
+            "Regenerate it with features.py using the current feature definitions."
+        )
     print(f"[train_model.py] {len(df):,} rows, {int(df['label'].sum()):,} positives")
 
     train_df, val_df = split_by_entity(df, test_size=args.test_size,
@@ -108,9 +129,14 @@ def main():
           f"({int(train_df['label'].sum()):,} pos)")
     print(f"[train_model.py] val:   {len(val_df):,} rows "
           f"({int(val_df['label'].sum()):,} pos)")
+    del df
+    gc.collect()
 
-    print("[train_model.py] training HGBC ...")
+    print("[train_model.py] training XGBoost ...")
     model = train(train_df)
+    os.makedirs(os.path.dirname(os.path.abspath(args.model_out)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.val_out)), exist_ok=True)
+    os.makedirs(os.path.dirname(os.path.abspath(args.threshold_out)), exist_ok=True)
     joblib.dump(model, args.model_out)
     val_df.to_csv(args.val_out, sep="\t", index=False)
     print(f"[train_model.py] model saved → {args.model_out}")
@@ -121,7 +147,7 @@ def main():
     print(f"[train_model.py] pass --threshold {best_thresh:.2f} to score_and_submit.py")
 
     # Save threshold to file for automatic pickup
-    with open("output/best_threshold.txt", "w") as fh:
+    with open(args.threshold_out, "w", encoding="utf-8") as fh:
         fh.write(str(best_thresh))
 
 
